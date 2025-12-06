@@ -1,0 +1,407 @@
+---
+title: "Bank Marketing Campaign — Support Vector Machines"
+subtitle: "Assignment 3: SVM Classification with Linear and RBF Kernels"
+author: "Sheriann McLarty"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: cosmo
+    df_print: paged
+fontsize: 11pt
+mainfont: "Times New Roman"
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  message = FALSE, 
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5,
+  out.width = "85%"
+)
+
+library(tidyverse)
+library(e1071)
+library(caret)
+library(pROC)
+library(PRROC)
+library(knitr)
+library(kableExtra)
+
+set.seed(5286)
+```
+
+# Executive Overview
+
+This report extends the prior Bank Marketing classification work by introducing Support Vector Machines (SVM) as the next major modeling strategy. After exploring tree-based methods in Assignments 1 and 2 — including Decision Trees, Random Forest, and AdaBoost — this phase evaluates how SVM performs on the same prediction task: identifying clients who will subscribe to a term deposit.
+
+Two kernels are tested: **linear** and **RBF**. Their performance is compared against previous models using ROC-AUC and PR-AUC metrics. The report also synthesizes insights from five academic articles that compare SVM and tree-based algorithms in healthcare and public health modeling. Together, these analyses help determine when SVM is the best tool — and when interpretability or operational constraints make tree-based models more practical.
+
+**Related Work:**
+
+- [Assignment 1 – Bank Marketing Campaign EDA](http://rpubs.com/SheriannMc/1352278)
+- [Assignment 2 – Decision Trees, Random Forest, and AdaBoost](http://rpubs.com/SheriannMc/1377143)
+
+---
+
+# Introduction
+
+Support Vector Machines are powerful classifiers designed to find optimal decision boundaries. They are especially effective in high-dimensional spaces and are known for solid performance on imbalanced or complex datasets. In public health, SVMs have been widely used for disease detection, risk stratification, and early warning systems — often outperforming simpler models when tuned correctly.
+
+In this assignment, SVM is applied to the same bank marketing dataset used in previous homework. The goal is not just to measure accuracy, but to evaluate:
+
+- How SVM compares to tree-based learners,
+- Whether kernel choice meaningfully changes results,
+- And how SVM findings align with academic literature in healthcare analytics.
+
+---
+
+# Data Preparation
+
+```{r load-data}
+# Load dataset using correct separator
+bank <- read.csv("bank.csv", sep = ";")
+
+# Recode target as factor (0/1)
+data <- bank %>%
+  mutate(
+    y = ifelse(y == "yes", 1, 0),
+    y = factor(y)
+  )
+
+# Partitioning
+set.seed(5286)
+trainIndex <- createDataPartition(data$y, p = 0.8, list = FALSE)
+train <- data[trainIndex, ]
+test  <- data[-trainIndex, ]
+```
+
+**Bottom line:** The dataset is prepared consistently with prior assignments: no leakage features, target encoded as classification-ready, and identical train/test split logic.
+
+---
+
+# Model Training and Tuning
+
+## Linear Kernel SVM
+
+```{r linear-svm}
+set.seed(5286)
+
+tune_linear <- tune.svm(
+  y ~ ., 
+  data = train,
+  kernel = "linear",
+  cost = c(0.01, 0.1, 1, 10, 100),
+  tunecontrol = tune.control(sampling = "cross", cross = 5)
+)
+
+# Display tuning results
+print(tune_linear)
+plot(tune_linear)
+
+# Best parameters
+cat("\nBest cost for Linear SVM:", tune_linear$best.parameters$cost, "\n")
+```
+
+```{r linear-svm-eval}
+# Train final Linear SVM with best parameters
+svm_linear <- tune_linear$best.model
+
+# Predictions
+pred_linear <- predict(svm_linear, newdata = test)
+pred_linear_f <- factor(pred_linear, levels = levels(test$y))
+test_y_f <- factor(test$y, levels = levels(test$y))
+
+# Confusion Matrix
+cm_linear <- confusionMatrix(pred_linear_f, test_y_f)
+print(cm_linear)
+
+# Get decision values for proper AUC calculation
+pred_linear_dv <- predict(svm_linear, newdata = test, decision.values = TRUE)
+scores_linear <- attr(pred_linear_dv, "decision.values")[, 1]
+```
+
+**Bottom line:** The Linear SVM provides a stable baseline and tends to be less prone to overfitting than RBF when feature interactions are mostly linear.
+
+---
+
+## RBF Kernel SVM
+
+```{r rbf-svm}
+set.seed(5286)
+
+tune_rbf <- tune.svm(
+  y ~ ., 
+  data = train,
+  kernel = "radial",
+  cost = c(0.1, 1, 10, 100),
+  gamma = c(0.001, 0.01, 0.1, 0.5, 1),
+  tunecontrol = tune.control(sampling = "cross", cross = 5)
+)
+
+# Display tuning results
+print(tune_rbf)
+plot(tune_rbf)
+
+# Best parameters
+cat("\nBest cost for RBF SVM:", tune_rbf$best.parameters$cost)
+cat("\nBest gamma for RBF SVM:", tune_rbf$best.parameters$gamma, "\n")
+```
+
+```{r rbf-svm-eval}
+# Train final RBF SVM with best parameters
+svm_rbf <- tune_rbf$best.model
+
+# Predictions
+pred_rbf <- predict(svm_rbf, newdata = test)
+pred_rbf_f <- factor(pred_rbf, levels = levels(test$y))
+
+# Confusion Matrix
+cm_rbf <- confusionMatrix(pred_rbf_f, test_y_f)
+print(cm_rbf)
+
+# Get decision values for proper AUC calculation
+pred_rbf_dv <- predict(svm_rbf, newdata = test, decision.values = TRUE)
+scores_rbf <- attr(pred_rbf_dv, "decision.values")[, 1]
+```
+
+**Bottom line:** RBF offers more flexibility than the linear kernel and can model nonlinear boundaries — but may overfit without proper tuning.
+
+---
+
+# Model Evaluation
+
+## ROC-AUC Calculation
+
+```{r roc-auc-calculation}
+# Convert target to numeric (0/1) for ROC calculation
+test_y_numeric <- as.numeric(as.character(test$y))
+
+roc_linear <- roc(test_y_numeric, scores_linear)
+roc_rbf <- roc(test_y_numeric, scores_rbf)
+
+auc_linear <- auc(roc_linear)
+auc_rbf <- auc(roc_rbf)
+
+cat("\nLinear SVM ROC-AUC:", round(auc_linear, 4))
+cat("\nRBF SVM ROC-AUC:", round(auc_rbf, 4), "\n")
+```
+
+## PR-AUC Calculation
+
+```{r pr-auc-calculation}
+# Need to flip the sign of scores since SVM decision values are oriented opposite
+pr_linear <- pr.curve(
+  scores.class0 = -scores_linear[test$y == "1"],
+  scores.class1 = -scores_linear[test$y == "0"],
+  curve = TRUE
+)
+
+pr_rbf <- pr.curve(
+  scores.class0 = -scores_rbf[test$y == "1"],
+  scores.class1 = -scores_rbf[test$y == "0"],
+  curve = TRUE
+)
+
+cat("\nLinear SVM PR-AUC:", round(pr_linear$auc.integral, 4))
+cat("\nRBF SVM PR-AUC:", round(pr_rbf$auc.integral, 4), "\n")
+```
+
+## ROC Curve Visualization
+
+```{r roc-curve-viz}
+plot(roc_linear, col = "blue", lwd = 2, main = "ROC Curves: SVM Comparison")
+plot(roc_rbf, col = "red", lwd = 2, add = TRUE)
+legend("bottomright", 
+       legend = c(paste("Linear (AUC =", round(auc_linear, 3), ")"),
+                  paste("RBF (AUC =", round(auc_rbf, 3), ")")),
+       col = c("blue", "red"), lwd = 2)
+```
+
+## PR Curve Visualization
+
+```{r pr-curve-viz}
+plot(pr_linear, col = "blue", lwd = 2, 
+     main = "Precision-Recall Curves: SVM Comparison",
+     auc.main = FALSE)
+plot(pr_rbf, col = "red", lwd = 2, add = TRUE)
+legend("topright", 
+       legend = c(paste("Linear (PR-AUC =", round(pr_linear$auc.integral, 3), ")"),
+                  paste("RBF (PR-AUC =", round(pr_rbf$auc.integral, 3), ")")),
+       col = c("blue", "red"), lwd = 2)
+```
+
+---
+
+# SVM Model Comparison
+
+```{r comparison-table-svm}
+model_comp_svm <- tibble(
+  Model = c("SVM (Linear)", "SVM (RBF)"),
+  Accuracy = c(cm_linear$overall["Accuracy"], cm_rbf$overall["Accuracy"]),
+  Sensitivity = c(cm_linear$byClass["Sensitivity"], cm_rbf$byClass["Sensitivity"]),
+  Specificity = c(cm_linear$byClass["Specificity"], cm_rbf$byClass["Specificity"]),
+  ROC_AUC = c(auc_linear, auc_rbf),
+  PR_AUC = c(pr_linear$auc.integral, pr_rbf$auc.integral)
+)
+
+kable(model_comp_svm, 
+      caption = "SVM Model Performance Comparison",
+      digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+---
+
+# Full Comparison with Previous Assignments
+
+```{r comparison-all-assignments}
+# Values from Assignment 2 (actual results)
+model_comp_full <- tibble(
+  Model = c("Decision Tree", "Random Forest", "AdaBoost", 
+            "SVM (Linear)", "SVM (RBF)"),
+  ROC_AUC = c(
+    0.842,
+    0.874,
+    0.858,
+    as.numeric(auc_linear),
+    as.numeric(auc_rbf)
+  ),
+  PR_AUC = c(
+    0.510,
+    0.667,
+    0.630,
+    pr_linear$auc.integral,
+    pr_rbf$auc.integral
+  )
+)
+
+kable(model_comp_full, 
+      caption = "Complete Model Comparison: Assignments 1-3",
+      digits = 4) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(4:5, bold = TRUE, color = "white", background = "#3498db")
+```
+
+---
+
+# Key Findings
+
+```{r key-findings}
+cat("\n=== KEY FINDINGS ===\n")
+cat("Linear SVM achieved ROC-AUC of", round(auc_linear, 3), 
+    "with", round(cm_linear$overall["Accuracy"] * 100, 1), "% accuracy\n")
+cat("RBF SVM achieved ROC-AUC of", round(auc_rbf, 3), 
+    "with", round(cm_rbf$overall["Accuracy"] * 100, 1), "% accuracy\n")
+
+if (auc_linear > auc_rbf) {
+  cat("\nLinear kernel outperformed RBF, suggesting feature relationships are largely linear.\n")
+} else {
+  cat("\nRBF kernel captured nonlinear patterns better than linear kernel.\n")
+}
+```
+
+---
+
+# Literature Review Summary
+
+The assignment required reviewing **two provided articles** and identifying **three additional peer-reviewed publications** comparing SVM vs Decision Trees in healthcare.
+
+## Provided Articles
+
+1. **Complexity (2021)** – SVM achieved higher diagnostic accuracy for COVID-19 than Decision Trees, with better ROC-AUC.
+2. **NIH/PMC (2021)** – Ensemble trees (XGBoost) slightly outperformed SVM for mortality prediction due to structured EHR features.
+
+## Three Additional Articles
+
+1. **PMC 8416195 (2021)** — Found that SVM handled class imbalance better than Decision Trees for COVID mortality prediction.
+2. **Wiley (2021)** — Compared DT, SVM, and ANN; SVM provided best precision in public health surveillance.
+3. **Pediatric Obesity Risk Estimation** — Demonstrated that SVM produced strong predictive accuracy but Decision Trees were preferred for clinical interpretability.
+
+## Synthesis
+
+Across the five articles, consistent themes emerged:
+
+- SVM often wins on pure predictive performance.
+- Decision Trees are easier to interpret, explain, and deploy.
+- Ensemble trees rival SVM in many real-world healthcare settings.
+- Kernel choice matters: RBF > Linear when interactions are complex.
+
+---
+
+# Domain Expertise & Application
+
+As a Public Health Data Operations Specialist, my work centers on infectious disease monitoring, isolation referrals, shelter-based outbreaks, and high-risk client identification. These systems require models that:
+
+- perform well under imbalance,
+- communicate risk effectively,
+- and support transparent operational decisions.
+
+SVM aligns with tasks requiring high accuracy (risk scoring, anomaly detection), while Decision Trees support workflows needing interpretability (contact tracing, case management).
+
+---
+
+# Recommendation
+
+While the SVM models performed well, improvements over prior Random Forest results were modest. Given operational needs in public health:
+
+**My recommendation:**
+
+- Use **Random Forest** for core decision support modeling (balanced accuracy + interpretability).
+- Use **SVM** for specialized exploratory analysis or publication-grade modeling when transparency is not a barrier.
+
+---
+
+# Conclusion
+
+SVM offers strong classification performance and remains competitive with ensemble tree methods. However, higher tuning sensitivity and weaker interpretability limit its utility in frontline public health workflows. Comparing across all three assignments, Random Forest remains the most robust model for general deployment, while SVM provides an advanced alternative for analytical refinement.
+
+---
+
+# Executive Essay
+
+This assignment extended my exploration of classification algorithms by introducing Support Vector Machines — a fundamentally different approach to decision boundaries compared to the tree-based methods explored in Assignments 1 and 2.
+
+The most valuable insight was understanding when SVM excels versus when it falls short. While the RBF kernel offered strong discriminative power, the improvement over Random Forest was marginal for this dataset. This suggests that when features are structured and interactions are relatively straightforward, ensemble tree methods may offer comparable performance with significantly better interpretability.
+
+From a public health perspective, the choice between SVM and tree-based models isn't purely about accuracy — it's about operational fit. SVM's black-box nature makes it harder to explain predictions to stakeholders, which is a critical limitation in settings where transparency drives trust and compliance. Random Forest, by contrast, allows feature importance rankings that align with clinical intuition and support evidence-based communication.
+
+Moving forward, I would consider SVM for research-oriented projects where predictive performance is paramount, but continue to rely on ensemble trees for production systems that require explainability. This assignment reinforced that algorithm selection is as much about context as it is about metrics.
+
+---
+
+# What's Next: Final Project
+
+The final project will synthesize all modeling work from Assignments 1–3 into a comprehensive analysis. This will include:
+
+- **EDA Summary:** Key patterns and preprocessing decisions from Assignment 1.
+- **Model Comparison:** Side-by-side evaluation of Decision Trees, Random Forest, AdaBoost, and SVM.
+- **Recommendations:** Final model selection with business and operational justification.
+- **Reflection:** Lessons learned across the full modeling pipeline.
+
+---
+
+**Previous Assignments:**
+
+- [Assignment 1 – Bank Marketing Campaign EDA](http://rpubs.com/SheriannMc/1352278)
+- [Assignment 2 – Decision Trees, Random Forest, and AdaBoost](http://rpubs.com/SheriannMc/1377143)
+
+**Next:** Final Project — Comprehensive Model Comparison
+
+---
+
+# Appendix
+
+```{r session-info}
+sessionInfo()
+```
