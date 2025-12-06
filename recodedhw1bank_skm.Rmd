@@ -1,0 +1,414 @@
+---
+title: "Bank Marketing Campaign EDA" subtitle: "What really drives term deposit
+sign-ups?" author: "Sheriann McLarty" date: "`r format(Sys.Date(), '%B %d,
+%Y')`" output: pdf_document: latex_engine: xelatex toc: true toc_depth: 3
+html_document: toc: true toc_float: true number_sections: true df_print: paged
+theme: journal fontsize: 11pt mainfont: Times New Roman geometry: margin=1in
+header-includes:
+  - \usepackage{graphicx}
+  - \usepackage{float}
+  - \floatplacement{figure}{H}
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{caption}
+  - \captionsetup[table]{skip=6pt}
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5,
+  out.width = "85%"
+)
+# define show_code variable
+show_code <- FALSE
+```
+```{r load libraries}
+# Libraries
+library(tidyverse)
+library(corrplot)
+library(kableExtra)
+```
+```{r load data}
+# Data
+bank <- read.csv("bank.csv", sep = ";")
+# Helper: tidy prop table
+prop_yes <- function(tbl){
+  out <- as.data.frame(tbl)
+  names(out) <- c("level","n")
+  out$prop <- out$n / sum(out$n)
+  out
+}
+# simple theme for kable
+kbl_q <- function(df, caption = NULL, digits = 3){
+  df %>%
+    kbl(caption = caption, digits = digits, booktabs = TRUE) %>%
+    kable_styling(full_width = FALSE, position = "center", bootstrap_options = c("striped"))
+}
+```
+> **Note:** This essay serves as the Executive Summary accompanying the
+Exploratory Data Analysis (EDA) of the Bank Marketing Campaign dataset.
+# Executive Summary & Findings
+This dataset captures a Portuguese bank’s phone campaigns: 4,521 rows, 17
+columns, a blend of numeric fields (age, balance, duration, campaign, pdays,
+previous) and categorical fields (job, marital, education, contact, month,
+poutcome). The target y indicates whether a client subscribed to a term deposit.
+What matters most. The headline is imbalance and targeting. The target is skewed
+about 89 percent “no” to 11 percent “yes.” If we do nothing, any model can “win”
+by predicting “no” every time. Accuracy will look great and be useless. The real
+lift comes from campaign design variables: previous outcome, contact method, and
+timing, not simple demographics like age.
+Central tendencies and spread. Age clusters in the late 30s to early 40s;
+nothing wild there. Balance and duration are extremely right-skewed with long
+tails. A handful of wealthy or very long-call cases will dominate a loss
+function if left untreated. That means we should log-transform duration and
+winsorize or log balance. Campaign count is concentrated around 1–3 calls;
+behavior after that tends to diminish returns.
+Categorical conversion rates (where the signal lives). When we compute
+conversion rates by category, we see sharp differences:
+Previous outcome (poutcome) is the strongest single indicator. A prior “success”
+predicts a dramatically higher current conversion rate. This is textbook: past
+positive engagement signals readiness.
+Contact method matters: cell calls generally outperform unknown contact
+channels.
+Month matters: conversion rates tend to spike in a few months (often March and
+December), while some high-volume months underperform. Timing is a lever.
+Correlations are not the whole story. Numeric features have weak linear
+correlation with the target; that is normal for marketing data. The heavy
+lifting comes from categoricals and interactions (for example, job × month,
+contact × previous outcome). That is exactly why linear correlation heatmaps
+underwhelm here.
+Missingness and duplicates. There are no formal NA values, but several fields
+use "unknown". Treat those as explicit levels or flagged missing. Duplicates are
+checked and removed if found (see Appendix code). This aligns with domain
+reality: not every client discloses job/education, and many have never been
+contacted before (pdays == -1).
+Algorithm selection. This is a supervised binary classification problem. Use
+Logistic Regression as a baseline for interpretability and stakeholder
+communication (coefficients map to odds). Use Gradient Boosting (or Random
+Forest) for performance, because it captures nonlinearities and interactions
+that dominate marketing outcomes. If the dataset were under 1,000 rows, I would
+prefer simpler models (Logistic/Decision Tree) to control overfitting.
+Preprocessing playbook. Address class imbalance with SMOTE or class weights.
+One-hot encode categoricals (job, education, contact, month, poutcome),
+optionally keeping "unknown" as its own level. Log-transform duration; log or
+winsorize balance; standardize numerics for linear models. Engineer high-value
+flags such as contacted_before (pdays > 0) and seasonal targets (high-conversion
+months). Evaluate with ROC-AUC and PR-AUC, not just accuracy.
+Bottom line. To get more deposits, do not just dial more — dial smarter.
+Prioritize clients with prior positive outcomes, use the best contact channel,
+and time outreach in stronger months. Fix the imbalance, encode categoricals,
+transform skew, and use Logistic Regression for storytelling with Gradient
+Boosting for lift. That’s the play.
+# Data Leakage Duration is the call length and is only known after the call. For
+any pre-call scoring or campaign targeting, duration must be excluded from model
+training and feature engineering. I will explicitly drop it in modeling chunks
+meant for pre-call use. # Exploratory Data Analysis
+**Structure and Shape**
+```{r Structure and Shape}
+dim(bank)
+str(bank)
+```
+**Bottom line.** Mostly categorical features with a few skewed numerics. Target is y (yes/no).
+## Preprocessing
+```{r preprocessing}
+## Preprocessing decisions reflected in later modeling
+bank_prep <- bank %>%
+  mutate(
+    # pdays = -1 means "never contacted" — recode to a labeled factor
+    pdays_cat = case_when(
+      pdays == -1 ~ "never_contacted",
+      pdays >= 0  ~ "contacted_before",
+      TRUE        ~ "unknown"
+    ),
+    pdays_cat = factor(pdays_cat),
+    # keep original for EDA; use *_cat in models
+    # high-cardinality example handling (group rare levels)
+    job_grp = fct_lump_n(factor(job), n = 10, other_level = "other_job"),
+    education_grp = fct_lump_n(factor(education), n = 6, other_level = "other_edu")
+  )
+```
+**Bottom-Line.** High-cardinality: I group infrequent job/education levels (top-N + “other”) to stabilize estimates and avoid sparse dummies. For tree models this is optional, but it simplifies interpretation and reduces variance.
+## Evaluation Plan Classification threshold: With ~89% “no,” the default 0.50
+cutoff is not optimal. I’ll tune the threshold on the validation set to maximize
+F1 (or Youden’s J for ROC, or optimize Recall@Precision≥X for business needs).
+Final reporting will include ROC-AUC and PR-AUC (better reflects minority-class
+lift) along with a threshold-tuned confusion matrix.
+## Conistency Checks + "unknown" + duplicates
+
+```{r data checks}
+## Data Consistency & Integrity
+# 1) exact duplicate rows
+dup_rows <- sum(duplicated(bank))
+
+# 2) structural NA vs sentinel "unknown"
+unknown_share <- bank %>%
+  summarise(across(everything(), ~mean(. == "unknown")*100)) %>%
+  pivot_longer(everything(), names_to="variable", values_to="pct_unknown") %>%
+  arrange(desc(pct_unknown))
+# 3) impossible ranges sanity checks (examples)
+range_checks <- tibble(
+  check = c("age >= 18", "campaign >= 1", "pdays == -1 allowed"),
+  valid = c(all(bank$age >= 18), all(bank$campaign >= 1), any(bank$pdays == -1))
+)
+kbl_q(tibble(Metric=c("Duplicate rows"), Value=c(dup_rows)), "Data Quality Checks")
+kbl_q(unknown_share, "Share of 'unknown' by Variable (%)", digits = 1)
+kbl_q(range_checks, "Range/Sentinel Sanity Checks")
+```
+## Central Tendency & Spread
+```{r Central Tendency & Spread}
+num_summary <- bank %>%
+  select(age, balance, duration, campaign, pdays, previous) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  group_by(variable) %>%
+  summarise(
+    n      = n(),
+    mean   = mean(value, na.rm = TRUE),
+    sd     = sd(value, na.rm = TRUE),
+    min    = min(value, na.rm = TRUE),
+    q25    = quantile(value, 0.25, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    q75    = quantile(value, 0.75, na.rm = TRUE),
+    max    = max(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+kbl_q(num_summary, "Summary of Numeric Predictors")
+```
+**Why it matters.** Balance and duration are heavily right-skewed. Outliers will hijack training unless we log/trim.
+## Distributions
+**The Shape Of The Problem**
+```{r distrubution and shape}
+bank %>%
+  select(age, balance, duration, campaign) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = value)) +
+  facet_wrap(~name, scales = "free", nrow = 2) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(title = "Key Numeric Distributions")
+```
+**Bottom line.** Transform balance and duration; treat campaign’s heavy mass at 1–3 calls carefully.
+## Target Balance
+**Imbalance Check**
+```{r imbalane check}
+prop_yes(table(bank$y)) %>%
+  mutate(level = factor(level, levels = c("no","yes"))) %>%
+  arrange(level) %>%
+  kbl_q("Target Class Balance", digits = 3)
+```
+**Bottom line.** With about 89 percent “no,” accuracy alone is a trap. Optimize recall/precision on “yes.”
+## Correlations **Numeric Only**
+```{r correlations}
+num_vars <- bank %>% select(where(is.numeric))
+cor_mat  <- cor(num_vars, use = "pairwise.complete.obs")
+corrplot(cor_mat, method = "color", type = "upper", tl.cex = 0.8)
+```
+**Bottom line**. Weak linear correlations are expected; the real signal is in categoricals and interactions.
+## Categorical Conversion
+**Where The Signal Lives**
+```{r cat conversion}
+conv_job <- bank %>%
+  group_by(job, y) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = y, values_from = n, values_fill = 0) %>%
+  rename(no = `no`, yes = `yes`) %>%
+  mutate(total = no + yes, conversion_rate = ifelse(total > 0, yes/total, NA_real_)) %>%
+  arrange(desc(conversion_rate))
+conv_job %>%
+  select(job, yes, no, total, conversion_rate) %>%
+  head(8) %>%
+  kbl_q("Top Job Categories by Conversion Rate", digits = 3)
+conv_contact <- bank %>%
+  group_by(contact, y) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = y, values_from = n, values_fill = 0) %>%
+  rename(no = `no`, yes = `yes`) %>%
+  mutate(total = no + yes, conversion_rate = yes/total) %>%
+  arrange(desc(conversion_rate))
+conv_poutcome <- bank %>%
+  group_by(poutcome, y) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = y, values_from = n, values_fill = 0) %>%
+  rename(no = `no`, yes = `yes`) %>%
+  mutate(total = no + yes, conversion_rate = yes/total) %>%
+  arrange(desc(conversion_rate))
+kbl_q(conv_contact %>% select(contact, yes, no, total, conversion_rate),
+      "Contact Method (Conversion Rate)", digits = 3)
+kbl_q(conv_poutcome %>% select(poutcome, yes, no, total, conversion_rate),
+      "Previous Outcome (Conversion Rate)", digits = 3)
+conv_month <- bank %>%
+  group_by(month, y) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = y, values_from = n, values_fill = 0) %>%
+  rename(no = `no`, yes = `yes`) %>%
+  mutate(total = no + yes, conversion_rate = yes/total) %>%
+  arrange(desc(conversion_rate))
+kbl_q(conv_month, "Conversion by Month", digits = 3)
+```
+**Bottom line.** Prior positive outcome, contact method, and timing are the levers. That is your targeting strategy.
+## Missingness *The "Unknown" Game*
+```{r missingness}
+missing_tbl <- bank %>%
+  summarise(across(everything(), ~mean(. == "unknown")*100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_unknown") %>%
+  arrange(desc(pct_unknown))
+kbl_q(missing_tbl, "Share of 'unknown' by Variable (%)", digits = 1)
+```
+**Bottom line.** Keep "unknown" as an explicit level or flag it. Do not silently drop it.
+# Outliers *Trim Or Transform?*
+```{r outliers}
+bank %>%
+  select(balance, duration, campaign) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = name, y = value)) +
+  geom_boxplot(fill = "orange") +
+  coord_cartesian(ylim = c(-1000, 5000)) +
+  labs(title = "Outliers in Key Numerics (Trimmed View)")
+```
+**Bottom line.** Log duration; log or winsorize balance; be cautious beyond 95th–99th percentiles.
+## Duplicates & Consistency Check
+```{r duplicate and consistency check}
+dup_n <- sum(duplicated(bank))
+kbl_q(tibble(Metric = c("Duplicate rows"), Value = dup_n), "Data Quality Check", digits = 0)
+```
+*Bottom line.** Remove duplicates if any appear; keep one distinct record.
+# Modeling Strategy *What Fits The Business*
+Logistic Regression — interpretable coefficients for stakeholders; great
+baseline; needs one-hot encoding and scaling.
+Gradient Boosting / Random Forest — stronger accuracy, handles nonlinearities
+and interactions; less transparent; use SHAP for explainability.
+Small data (< 1000 rows) — prefer simpler models (Logistic/Decision Tree) to
+avoid overfitting.
+*Recommendation:* baseline with Logistic Regression for storytelling; deploy Gradient Boosting for lift. Evaluate with ROC-AUC and PR-AUC, not plain accuracy.
+## Preprocessing Plan *Execution Playbook*
+Imbalance: SMOTE or class weights; report ROC-AUC and PR-AUC.
+Categoricals: one-hot encode job, education, contact, month, poutcome; keep
+"unknown" explicit or add missing flags.
+Numerics: log-transform duration; log or winsorize balance; standardize for
+linear models.
+Features: contacted_before (pdays > 0); seasonal flags for high-conversion
+months; optional interactions.
+Sanity: drop duplicates; trim extreme values where appropriate.
+# Conclusion
+If the goal is more deposits, do not just dial more — dial smarter. Prioritize
+people with prior positive outcomes, use the right contact method, and time the
+calls when conversion is historically stronger. Fix the imbalance, encode
+categoricals, transform skewed numerics, and pair Logistic Regression
+(explainability) with Gradient Boosting (performance). That is the plan I would
+ship.
+\newpage \addtocontents{toc}{\protect\setcounter{tocdepth}{0}} # Appendix: R
+Full Code
+```{r,full code, echo=TRUE}
+# Libraries
+library(tidyverse)
+library(corrplot)
+library(kableExtra)
+# Data
+bank <- read.csv("bank.csv", sep = ";")
+# Dimensions & structure
+dim(bank); str(bank)
+## Preprocessing decisions reflected in later modeling
+bank_prep <- bank %>%
+  mutate(
+    # pdays = -1 means "never contacted" — recode to a labeled factor
+    pdays_cat = case_when(
+      pdays == -1 ~ "never_contacted",
+      pdays >= 0  ~ "contacted_before",
+      TRUE        ~ "unknown"
+    ),
+    pdays_cat = factor(pdays_cat),
+    # keep original for EDA; use *_cat in models
+    # high-cardinality example handling (group rare levels)
+    job_grp = fct_lump_n(factor(job), n = 10, other_level = "other_job"),
+    education_grp = fct_lump_n(factor(education), n = 6, other_level = "other_edu")
+  )
+## Data Consistency & Integrity
+# 1) exact duplicate rows
+dup_rows <- sum(duplicated(bank))
+# 2) structural NA vs sentinel "unknown"
+unknown_share <- bank %>%
+  summarise(across(everything(), ~mean(. == "unknown")*100)) %>%
+  pivot_longer(everything(), names_to="variable", values_to="pct_unknown") %>%
+  arrange(desc(pct_unknown))
+# 3) impossible ranges sanity checks (examples)
+range_checks <- tibble(
+  check = c("age >= 18", "campaign >= 1", "pdays == -1 allowed"),
+  valid = c(all(bank$age >= 18), all(bank$campaign >= 1), any(bank$pdays == -1))
+)
+kbl_q(tibble(Metric=c("Duplicate rows"), Value=c(dup_rows)), "Data Quality Checks")
+kbl_q(unknown_share, "Share of 'unknown' by Variable (%)", digits = 1)
+kbl_q(range_checks, "Range/Sentinel Sanity Checks")
+# Central tendency
+summary(select(bank, age, balance, duration, campaign, pdays, previous))
+# Distributions
+bank %>%
+  select(age, balance, duration, campaign) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = value)) +
+  facet_wrap(~name, scales = "free", nrow = 2) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(title = "Key Numeric Distributions")
+# Target balance
+as.data.frame(prop.table(table(bank$y)))
+# Correlations (numeric only)
+num_vars <- bank %>% select(where(is.numeric))
+cor_mat  <- cor(num_vars, use = "pairwise.complete.obs")
+corrplot(cor_mat, method = "color", type = "upper", tl.cex = 0.8)
+# Categorical conversion rates
+conv_job <- bank %>%
+  group_by(job, y) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = y, values_from = n, values_fill = 0) %>%
+  rename(no = `no`, yes = `yes`) %>%
+  mutate(total = no + yes, conversion_rate = yes / total) %>%
+  arrange(desc(conversion_rate))
+head(conv_job, 10)
+conv_contact <- bank %>%
+  group_by(contact, y) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = y, values_from = n, values_fill = 0) %>%
+  rename(no = `no`, yes = `yes`) %>%
+  mutate(total = no + yes, conversion_rate = yes / total) %>%
+  arrange(desc(conversion_rate))
+conv_contact
+conv_poutcome <- bank %>%
+  group_by(poutcome, y) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = y, values_from = n, values_fill = 0) %>%
+  rename(no = `no`, yes = `yes`) %>%
+  mutate(total = no + yes, conversion_rate = yes / total) %>%
+  arrange(desc(conversion_rate))
+conv_poutcome
+conv_month <- bank %>%
+  group_by(month, y) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = y, values_from = n, values_fill = 0) %>%
+  rename(no = `no`, yes = `yes`) %>%
+  mutate(total = no + yes, conversion_rate = yes / total) %>%
+  arrange(desc(conversion_rate))
+conv_month
+# Missingness as % "unknown"
+missing_tbl <- bank %>%
+  summarise(across(everything(), ~mean(. == "unknown")*100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_unknown") %>%
+  arrange(desc(pct_unknown))
+missing_tbl
+# Outliers (trimmed view)
+bank %>%
+  select(balance, duration, campaign) %>%
+  pivot_longer(everything()) %>%
+  ggplot(aes(x = name, y = value)) +
+  geom_boxplot(fill = "orange") +
+  coord_cartesian(ylim = c(-1000, 5000)) +
+  labs(title = "Outliers in Key Numerics (Trimmed)")
+# Duplicate check
+sum(duplicated(bank))
+```
+\addtocontents{toc}{\protect\setcounter{tocdepth}{2}}}
